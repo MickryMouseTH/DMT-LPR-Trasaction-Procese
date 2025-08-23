@@ -21,42 +21,50 @@ default_config = {
             "log_Level": "DEBUG",
             "Log_Console": 1,  # Set to "true" to enable console logging.
             "log_Backup": 90,         # Log retention duration (number of backup files).
-            "Log_Size": "10 MB"       # Maximum log file size before rotation.
+            "Log_Size": "10 MB"       # Maximum log file size before rotation. 
         }
 
+        # Load the configuration
+        config = Load_Config(default_config, Program_Name, dir_path)
+
+        # Initialize the logger
+        logger = Loguru_Logging(config, Program_Name, Program_Version, dir_path)
+
+        return config, logger
 '''
 
-def Load_Config(default_config,Program_Name):
+def Load_Config(default_config,Program_Name,dir_path):
     # Define the configuration file path.
-    config_file_path = f'{Program_Name}.config.json'
+    config_file_name = f'{Program_Name}_config.json'
+    config_path = os.path.join(dir_path, config_file_name)
 
     # Create config file with default values if it does not exist.
-    if not os.path.exists(config_file_path):
+    if not os.path.exists(config_path):
         default_config = default_config 
-        with open(config_file_path, 'w') as new_config_file:
+        with open(config_path, 'w') as new_config_file:
             json.dump(default_config, new_config_file, indent=4)
 
     # Load configuration
-    with open(config_file_path, 'r') as config_file:
+    with open(config_path, 'r') as config_file:
         config = json.load(config_file)
     
     return config
 
 # ----------------------- Loguru Logging Setup -----------------------
-def Loguru_Logging(config,Program_Name,Program_Version):
+def Loguru_Logging(config,Program_Name,Program_Version,dir_path):
     logger.remove()
 
-    log_Backup = int(config['log_Backup'])
-    Log_Size = config['Log_Size']
-    log_Level = config['log_Level']
+    log_Backup = int(config.get('log_Backup', 90))
+    Log_Size = config.get('Log_Size', '10 MB').upper()
+    log_Level = config.get('log_Level', 'DEBUG').upper()
 
-    log_dir = "logs"
+    log_dir = os.path.join(dir_path, 'logs')
     os.makedirs(log_dir, exist_ok=True)
 
     log_file_name = f'{Program_Name}_{Program_Version}.log'
     log_file = os.path.join(log_dir, log_file_name)
 
-    if config['Log_Console'] == 1:
+    if config.get('Log_Console', 0) == 1:
         logger.add(
             sys.stdout, 
             level=log_Level, 

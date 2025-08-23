@@ -11,6 +11,7 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import itertools
 import threading # 2. เพิ่ม import threading
+import sys
 
 # ... (ส่วน Configuration ของคุณเหมือนเดิม) ...
 
@@ -18,6 +19,11 @@ import threading # 2. เพิ่ม import threading
 Program_Name = "Trasation-Process"
 Program_Version = "3.0"  # Updated version with Circuit Breaker
 # ---------------------------------------------------------------------
+
+if getattr(sys, 'frozen', False):
+    dir_path = os.path.dirname(sys.executable)
+else:
+    dir_path = os.path.dirname(os.path.abspath(__file__))
 
 default_config = {
     "DB_SERVER": "",
@@ -50,8 +56,8 @@ default_config = {
     "Log_Size": "10 MB",
 }
 
-config = Load_Config(default_config, Program_Name)
-logger = Loguru_Logging(config, Program_Name, Program_Version)
+config = Load_Config(default_config, Program_Name, dir_path)
+logger = Loguru_Logging(config, Program_Name, Program_Version, dir_path)
 logger.debug("Loaded configuration: {}", config)
 
 # ----------------------- Circuit Breaker Configuration -----------------------
