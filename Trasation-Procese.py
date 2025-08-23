@@ -11,13 +11,14 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import itertools
 import threading # 2. เพิ่ม import threading
+import queue
 import sys
 
 # ... (ส่วน Configuration ของคุณเหมือนเดิม) ...
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Trasation-Process"
-Program_Version = "3.0"  # Updated version with Circuit Breaker
+Program_Version = "3.2"  # Updated version with Circuit Breaker
 # ---------------------------------------------------------------------
 
 if getattr(sys, 'frozen', False):
@@ -240,8 +241,9 @@ def get_available_target_url() -> Optional[str]:
     return None
 
 
-def process_single_transaction(row, conn):
+def process_single_transaction(row, update_queue):
     try:
+        logger.debug(f"[process_single_transaction] Start processing row: {row}")
         transaction_id = row[0]
         transaction_datetime = row[4]
         plaza_id = row[1]
@@ -257,7 +259,9 @@ def process_single_transaction(row, conn):
         }
 
         for idx, image_path in enumerate(image_paths):
+            logger.debug(f"[process_single_transaction] Try image_path index {idx}: {image_path}")
             license_plate, province, confidence = try_send_image(image_path, transaction_datetime, transaction_id)
+            logger.debug(f"[process_single_transaction] Result from try_send_image: license_plate={license_plate}, province={province}, confidence={confidence}")
             if license_plate == "NO_IMAGE":
                 continue
             if license_plate is not None and confidence is not None and confidence > best_result["confidence"]:
@@ -268,23 +272,28 @@ def process_single_transaction(row, conn):
                     "source": f"IMAGE_FILE_0{idx+1}"
                 }
 
+        logger.debug(f"[process_single_transaction] Best result for transaction_id {transaction_id}: {best_result}")
+
         # ถ้าไม่มีรูปเลย
         if best_result["license_plate"] == "NO_IMAGE" or best_result["confidence"] == -1:
             logger.warning(f"Update DB as No Image for transaction_id: {transaction_id}")
-            if conn:
-                update_transaction_result(conn, transaction_id, "No Image", "", transaction_datetime, plaza_id, lane_id, ntrx_no)
+            logger.debug(f"[process_single_transaction] Put to update_queue: No Image, transaction_id={transaction_id}")
+            update_queue.put((transaction_id, "No Image", "", transaction_datetime, plaza_id, lane_id, ntrx_no))
+            logger.debug(f"[process_single_transaction] update_queue size after put: {update_queue.qsize()}")
             return
 
         # ถ้าไม่มีป้ายทะเบียนเลย
         if not best_result["license_plate"]:
             logger.warning(f"Update DB as No Plate for transaction_id: {transaction_id}")
-            if conn:
-                update_transaction_result(conn, transaction_id, "No Plate", best_result["province"] if best_result["province"] else "", transaction_datetime, plaza_id, lane_id, ntrx_no)
+            logger.debug(f"[process_single_transaction] Put to update_queue: No Plate, transaction_id={transaction_id}")
+            update_queue.put((transaction_id, "No Plate", best_result["province"] if best_result["province"] else "", transaction_datetime, plaza_id, lane_id, ntrx_no))
+            logger.debug(f"[process_single_transaction] update_queue size after put: {update_queue.qsize()}")
             return
 
         # ถ้า API error หรือ circuit breaker
         if best_result["license_plate"] is None and best_result["province"] is None:
             logger.warning(f"Skip DB update for transaction_id: {transaction_id} because API call failed or TARGET_URL unavailable.")
+            logger.debug(f"[process_single_transaction] Skip DB update for transaction_id: {transaction_id}")
             return
 
         # ปกติ
@@ -292,18 +301,18 @@ def process_single_transaction(row, conn):
             f"Update DB for transaction_id: {transaction_id} | Selected license_plate: {best_result['license_plate']} | "
             f"province: {best_result['province']} | confidence: {best_result['confidence']} | source: {best_result['source']}"
         )
-        if conn:
-            update_transaction_result(
-                conn, transaction_id,
-                best_result["license_plate"] if best_result["license_plate"] else "",
-                best_result["province"] if best_result["province"] else "",
-                transaction_datetime,
-                plaza_id,
-                lane_id,
-                ntrx_no
-            )
-        else:
-            logger.error(f"Cannot update DB for transaction_id {transaction_id} because the database connection is invalid.")
+        logger.debug(f"[process_single_transaction] Put to update_queue: transaction_id={transaction_id}, license_plate={best_result['license_plate']}, province={best_result['province']}")
+        update_queue.put((
+            transaction_id,
+            best_result["license_plate"] if best_result["license_plate"] else "",
+            best_result["province"] if best_result["province"] else "",
+            transaction_datetime,
+            plaza_id,
+            lane_id,
+            ntrx_no
+        ))
+        logger.debug(f"[process_single_transaction] update_queue size after put: {update_queue.qsize()}")
+        logger.debug(f"[process_single_transaction] Finished for transaction_id: {transaction_id}")
     except Exception as e:
         logger.error(f"Exception in process_single_transaction: {e}", exc_info=True)
 
@@ -393,7 +402,7 @@ def try_send_image(image_path, transaction_datetime, transaction_id):
 def process_transactions():
     """
     Process transaction data from the database using multi-threading for API calls
-    and a shared database connection for updates.
+    and a single-threaded queue for DB updates to avoid deadlocks.
     """
     conn = get_db_connection()
     if not conn:
@@ -403,43 +412,79 @@ def process_transactions():
     try:
         cursor = conn.cursor()
         cursor.execute(SQL_QUERY)
-        rows = cursor.fetchall()
-        logger.debug(f'Fetched Data: {rows}')
-        logger.info(f"Found {len(rows)} records to process.")
+        try:
+            cursor = conn.cursor()
+            cursor.execute(SQL_QUERY)
+            rows = cursor.fetchall()
+            logger.debug(f'Fetched Data: {rows}')
+            logger.info(f"Found {len(rows)} records to process.")
 
-        # เพิ่ม log แสดงตัวอย่าง row
-        if rows:
-            logger.debug(f"Sample row: {rows[0]}")
-
-        if not rows:
-            return
-
-        if config.get('Enable_Fix_Workers', 0) >= 1:
-            workers = config.get('Workers', 4)
-            logger.info(f"Using fixed {workers} worker threads.")
-        else:
-            workers = len(TARGET_URLS)
-            if workers == 0:
-                logger.error("No TARGET_URL configured. Cannot process.")
+            if rows:
+                logger.debug(f"Sample row: {rows[0]}")
+            if not rows:
                 return
-            logger.info(f"Using {workers} worker threads based on number of TARGET_URLs.")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            # 8. แก้ไขการ submit งาน: ไม่ต้องส่ง target_url เข้าไปแล้ว
-            #    เพราะ worker จะไปหา URL ที่พร้อมใช้งานเอง
-            futures = [
-                executor.submit(process_single_transaction, row, conn)
-                for row in rows
-            ]
-            concurrent.futures.wait(futures)
-            logger.info("All processing tasks for this batch have been completed.")
+            update_queue = queue.Queue()
 
-    except Exception as e:
-        logger.error(f"An error occurred during transaction processing: {e}", exc_info=True)
-    finally:
+            def db_update_worker():
+                logger.debug("[db_update_worker] DB update worker started.")
+                while True:
+                    item = update_queue.get()
+                    logger.debug(f"[db_update_worker] Got item from queue: {item}")
+                    logger.debug(f"[db_update_worker] update_queue size after get: {update_queue.qsize()}")
+                    if item is None:
+                        logger.debug("[db_update_worker] Received shutdown signal (None). Exiting worker.")
+                        update_queue.task_done()
+                        break
+                    try:
+                        logger.debug(f"[db_update_worker] Calling update_transaction_result with: {item}")
+                        update_transaction_result(conn, *item)
+                    except Exception as e:
+                        logger.error(f"DB update worker error: {e}")
+                    finally:
+                        update_queue.task_done()
+
+            db_thread = threading.Thread(target=db_update_worker)
+            db_thread.start()
+
+            if config.get('Enable_Fix_Workers', 0) >= 1:
+                workers = config.get('Workers', 4)
+                logger.info(f"Using fixed {workers} worker threads.")
+            else:
+                workers = len(TARGET_URLS)
+                if workers == 0:
+                    logger.error("No TARGET_URL configured. Cannot process.")
+                    update_queue.put(None)
+                    db_thread.join()
+                    return
+                logger.info(f"Using {workers} worker threads based on number of TARGET_URLs.")
+
+            logger.debug(f"[process_transactions] Starting ThreadPoolExecutor with {workers} workers.")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(process_single_transaction, row, update_queue)
+                    for row in rows
+                ]
+                logger.debug(f"[process_transactions] Submitted {len(futures)} tasks to ThreadPoolExecutor.")
+                concurrent.futures.wait(futures)
+                logger.info("All processing tasks for this batch have been completed.")
+
+            logger.debug("[process_transactions] Waiting for update_queue to be empty...")
+            update_queue.join()
+            logger.debug("[process_transactions] update_queue is empty. Sending shutdown signal to db_update_worker.")
+            update_queue.put(None)
+            db_thread.join()
+            logger.info("All DB updates completed.")
+
+        except Exception as e:
+            logger.error(f"An error occurred during transaction processing: {e}", exc_info=True)
+
         if conn:
             conn.close()
             logger.info("Database connection closed.")
+    
+    except Exception as e:
+        logger.critical(f"An unhandled exception occurred in process_transactions: {e}", exc_info=True)
 
 
 # ... (ส่วน update_transaction_result และ if __name__ == "__main__": เหมือนเดิม) ...
