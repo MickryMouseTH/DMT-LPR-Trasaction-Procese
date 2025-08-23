@@ -3,12 +3,10 @@ import requests
 import base64
 from datetime import datetime, timedelta # 1. เพิ่ม import timedelta
 import time
-import json
 import os
-from typing import List, Optional
+from typing import Optional
 from LogLibrary import Load_Config, Loguru_Logging
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 import itertools
 import threading # 2. เพิ่ม import threading
 import queue
