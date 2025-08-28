@@ -16,7 +16,7 @@ import sys
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Trasation-Process"
-Program_Version = "3.2"  # Updated version with Circuit Breaker
+Program_Version = "3.3"  # Updated version with Circuit Breaker
 # ---------------------------------------------------------------------
 
 if getattr(sys, 'frozen', False):
@@ -276,7 +276,7 @@ def process_single_transaction(row, update_queue):
         if best_result["license_plate"] == "NO_IMAGE" or best_result["confidence"] == -1:
             logger.warning(f"Update DB as No Image for transaction_id: {transaction_id}")
             logger.debug(f"[process_single_transaction] Put to update_queue: No Image, transaction_id={transaction_id}")
-            update_queue.put((transaction_id, "No Image", "", transaction_datetime, plaza_id, lane_id, ntrx_no))
+            update_queue.put((transaction_id, "No Image", "", transaction_datetime, plaza_id, lane_id, ntrx_no, None))
             logger.debug(f"[process_single_transaction] update_queue size after put: {update_queue.qsize()}")
             return
 
@@ -284,7 +284,7 @@ def process_single_transaction(row, update_queue):
         if not best_result["license_plate"]:
             logger.warning(f"Update DB as No Plate for transaction_id: {transaction_id}")
             logger.debug(f"[process_single_transaction] Put to update_queue: No Plate, transaction_id={transaction_id}")
-            update_queue.put((transaction_id, "No Plate", best_result["province"] if best_result["province"] else "", transaction_datetime, plaza_id, lane_id, ntrx_no))
+            update_queue.put((transaction_id, "No Plate", best_result["province"] if best_result["province"] else "", transaction_datetime, plaza_id, lane_id, ntrx_no, best_result["source"]))
             logger.debug(f"[process_single_transaction] update_queue size after put: {update_queue.qsize()}")
             return
 
@@ -307,7 +307,8 @@ def process_single_transaction(row, update_queue):
             transaction_datetime,
             plaza_id,
             lane_id,
-            ntrx_no
+            ntrx_no,
+            best_result["source"]
         ))
         logger.debug(f"[process_single_transaction] update_queue size after put: {update_queue.qsize()}")
         logger.debug(f"[process_single_transaction] Finished for transaction_id: {transaction_id}")
@@ -428,7 +429,7 @@ def process_transactions():
                 logger.debug("[db_update_worker] DB update worker started.")
                 while True:
                     item = update_queue.get()
-                    logger.debug(f"[db_update_worker] Got item from queue: {item}")
+                    logger.debug(f"[db_update_worker] Got item from queue: {repr(item)}")
                     logger.debug(f"[db_update_worker] update_queue size after get: {update_queue.qsize()}")
                     if item is None:
                         logger.debug("[db_update_worker] Received shutdown signal (None). Exiting worker.")
@@ -486,7 +487,7 @@ def process_transactions():
 
 
 # ... (ส่วน update_transaction_result และ if __name__ == "__main__": เหมือนเดิม) ...
-def update_transaction_result(conn, transaction_id, license_plate, province, transaction_datetime, plaza_id, lane_id, ntrx_no):
+def update_transaction_result(conn, transaction_id, license_plate, province, transaction_datetime, plaza_id, lane_id, ntrx_no, image_source):
     """
     Update transaction result in the database using a provided connection.
     If license_plate and province are empty, set DMTPX_LICENCEPLATE = 'No LPR'.
@@ -497,16 +498,16 @@ def update_transaction_result(conn, transaction_id, license_plate, province, tra
         # Each thread should use its own cursor from the shared connection
         with conn.cursor() as cursor:
             if license_plate == "" and province == "":
-                logger.debug(f"Updating DB: DMTPX_ID={transaction_id}, DMTPX_PLAZA_ID={plaza_id}, DMTPX_LANE_ID={lane_id}, DMTPX_NTRX_NO={ntrx_no}, TRXDate={transaction_datetime}, DMTPX_LICENCEPLATE='No LPR'")
+                logger.debug(f"Updating DB: DMTPX_ID={transaction_id}, DMTPX_PLAZA_ID={plaza_id}, DMTPX_LANE_ID={lane_id}, DMTPX_NTRX_NO={ntrx_no}, TRXDate={transaction_datetime}, DMTPX_LICENCEPLATE='No LPR', DMTPX_PROMOTIONID={image_source}")
                 cursor.execute(
-                    "UPDATE DMT_PASSING_TRANSACTION SET DMTPX_LICENCEPLATE = ? WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
-                    ("No LPR", transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
+                    "UPDATE DMT_PASSING_TRANSACTION SET DMTPX_LICENCEPLATE = ?, DMTPX_PROMOTIONID = ? WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
+                    ("No LPR", image_source, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
                 )
             else:
-                logger.debug(f"Updating DB: DMTPX_ID={transaction_id}, DMTPX_PLAZA_ID={plaza_id}, DMTPX_LANE_ID={lane_id}, DMTPX_NTRX_NO={ntrx_no}, TRXDate={transaction_datetime}, DMTPX_LICENCEPLATE='{license_plate}', DMTPX_PROVINCEID='{province}'")
+                logger.debug(f"Updating DB: DMTPX_ID={transaction_id}, DMTPX_PLAZA_ID={plaza_id}, DMTPX_LANE_ID={lane_id}, DMTPX_NTRX_NO={ntrx_no}, TRXDate={transaction_datetime}, DMTPX_LICENCEPLATE='{license_plate}', DMTPX_PROVINCEID='{province}', DMTPX_PROMOTIONID={image_source}")
                 cursor.execute(
-                    "UPDATE DMT_PASSING_TRANSACTION SET DMTPX_LICENCEPLATE = ?, DMTPX_PROVINCEID = ? WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
-                    (license_plate, province, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
+                    "UPDATE DMT_PASSING_TRANSACTION SET DMTPX_LICENCEPLATE = ?, DMTPX_PROVINCEID = ?, DMTPX_PROMOTIONID = ? WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
+                    (license_plate, province, image_source, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
                 )
             conn.commit()
         logger.info(f"Database updated successfully (transaction_id: {transaction_id})")
