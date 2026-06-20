@@ -3,7 +3,6 @@ import requests
 import base64
 from datetime import datetime, timedelta
 import time
-import os
 from typing import Optional, Tuple, List
 from LogLibrary import Load_Config, Loguru_Logging
 import concurrent.futures
@@ -11,7 +10,6 @@ import itertools
 import threading
 import random
 import queue
-import sys
 import re
 
 # new: สำหรับ HTTP connection pool/retry
@@ -24,13 +22,7 @@ except Exception:
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Trasation_Process"
-Program_Version = "5.0"
-
-# กำหนด path ทำงานเท่าเดิม
-if getattr(sys, 'frozen', False):
-    dir_path = os.path.dirname(sys.executable)
-else:
-    dir_path = os.path.dirname(os.path.abspath(__file__))
+Program_Version = "6.0.1"
 
 # ค่าตั้งต้น
 default_config = {
@@ -59,8 +51,7 @@ default_config = {
     "Workers": 4,
 
     "TARGET_URL": [
-        "http://localhost:8000/api/dmt/index.php",
-        "http://localhost:8001/api/dmt/index.php"
+        "http://localhost:8000/api/v1/alpr"
     ],
     "URL_TIMEOUT_THRESHOLD": 5,
     "URL_DISABLE_DURATION_SECONDS": 3600,
@@ -120,82 +111,43 @@ URL_STATUS_LOCK = threading.Lock()
 target_url_cycler = itertools.cycle(TARGET_URLS) if TARGET_URLS else None
 
 # ----------------------- SQL Query ตาม Lane_Type -----------------------
+# Lane_Type กำหนดเฉพาะชุด payment method — โครง query เหมือนกันทุกแบบ
+_PAYMENT_METHODS_BY_LANE = {
+    'ALL': "1,2,3,4,5,6,9,17,18,19,20",
+    'MTC': "1,2,3,4,17,18,19,20",
+    'ETC': "5,6,9",
+}
+
 Lane_Type = config.get('Lane_Type', 'ALL')
-if Lane_Type == 'ALL':
-    SQL_QUERY = f"""
-        SELECT TOP {config.get('QUERY_LIMIT', 100)}
-            dpt.DMTPX_ID,
-            dpt.DMTPX_PLAZA_ID,
-            dpt.DMTPX_LANE_ID,
-            dpt.DMTPX_NTRX_NO,
-            dpt.DMTPX_TRX_DATETIME,
-            dpt.DMTPX_TC_PAYMENTMETHOD_ID,
-            dpt.DMTPX_SIGNAL_CODE,
-            dpt.DMTPX_LICENCEPLATE,
-            dpt.DMTPX_PROVINCEID,
-            dpt.DMTPX_IMAGE_FILE_02 as Image1,
-            dpt.DMTPX_IMAGE_FILE_01 as Image2,
-            dpt.DMTPX_IMAGE_FILE_03 as Image3
-        FROM DMT_PASSING_TRANSACTION dpt
-        WHERE dpt.DMTPX_TRX_DATETIME
-            BETWEEN DATEADD(DAY,-{config.get('Back_date',7)},CONCAT(CONVERT(DATE,GETDATE()),' 00:00:00.000'))
-                AND DATEADD(minute,-{config.get('Back_Time',10)},GETDATE())
-        AND dpt.DMTPX_TRX_DATETIME >= '2025-07-25 00:00:00.000'
-        AND dpt.DMTPX_TC_PAYMENTMETHOD_ID IN (1,2,3,4,5,6,9,17,18,19,20)
-        AND dpt.DMTPX_SIGNAL_CODE IN (1,2,10,19,82,20,22,23,24,26)
-        AND (dpt.DMTPX_LICENCEPLATE IS NULL OR dpt.DMTPX_LICENCEPLATE = '')
-        ORDER BY dpt.DMTPX_TRX_DATETIME;
-    """
-elif Lane_Type == 'MTC':
-    SQL_QUERY = f"""
-        SELECT TOP {config.get('QUERY_LIMIT', 100)}
-            dpt.DMTPX_ID,
-            dpt.DMTPX_PLAZA_ID,
-            dpt.DMTPX_LANE_ID,
-            dpt.DMTPX_NTRX_NO,
-            dpt.DMTPX_TRX_DATETIME,
-            dpt.DMTPX_TC_PAYMENTMETHOD_ID,
-            dpt.DMTPX_SIGNAL_CODE,
-            dpt.DMTPX_LICENCEPLATE,
-            dpt.DMTPX_PROVINCEID,
-            dpt.DMTPX_IMAGE_FILE_02 as Image1,
-            dpt.DMTPX_IMAGE_FILE_01 as Image2,
-            dpt.DMTPX_IMAGE_FILE_03 as Image3
-        FROM DMT_PASSING_TRANSACTION dpt
-        WHERE dpt.DMTPX_TRX_DATETIME
-            BETWEEN DATEADD(DAY,-{config.get('Back_date',7)},CONCAT(CONVERT(DATE,GETDATE()),' 00:00:00.000'))
-                AND DATEADD(minute,-{config.get('Back_Time',10)},GETDATE())
-        AND dpt.DMTPX_TRX_DATETIME >= '2025-07-25 00:00:00.000'
-        AND dpt.DMTPX_TC_PAYMENTMETHOD_ID IN (1,2,3,4,17,18,19,20)
-        AND dpt.DMTPX_SIGNAL_CODE IN (1,2,10,19,82,20,22,23,24,26)
-        AND (dpt.DMTPX_LICENCEPLATE IS NULL OR dpt.DMTPX_LICENCEPLATE = '')
-        ORDER BY dpt.DMTPX_TRX_DATETIME;
-    """
-else:  # ETC
-    SQL_QUERY = f"""
-        SELECT TOP {config.get('QUERY_LIMIT', 100)}
-            dpt.DMTPX_ID,
-            dpt.DMTPX_PLAZA_ID,
-            dpt.DMTPX_LANE_ID,
-            dpt.DMTPX_NTRX_NO,
-            dpt.DMTPX_TRX_DATETIME,
-            dpt.DMTPX_TC_PAYMENTMETHOD_ID,
-            dpt.DMTPX_SIGNAL_CODE,
-            dpt.DMTPX_LICENCEPLATE,
-            dpt.DMTPX_PROVINCEID,
-            dpt.DMTPX_IMAGE_FILE_02 as Image1,
-            dpt.DMTPX_IMAGE_FILE_01 as Image2,
-            dpt.DMTPX_IMAGE_FILE_03 as Image3
-        FROM DMT_PASSING_TRANSACTION dpt
-        WHERE dpt.DMTPX_TRX_DATETIME
-            BETWEEN DATEADD(DAY,-{config.get('Back_date',7)},CONCAT(CONVERT(DATE,GETDATE()),' 00:00:00.000'))
-                AND DATEADD(minute,-{config.get('Back_Time',10)},GETDATE())
-        AND dpt.DMTPX_TRX_DATETIME >= '2025-07-25 00:00:00.000'
-        AND dpt.DMTPX_TC_PAYMENTMETHOD_ID IN (5,6,9)
-        AND dpt.DMTPX_SIGNAL_CODE IN (1,2,10,19,82,20,22,23,24,26)
-        AND (dpt.DMTPX_LICENCEPLATE IS NULL OR dpt.DMTPX_LICENCEPLATE = '')
-        ORDER BY dpt.DMTPX_TRX_DATETIME;
-    """
+if Lane_Type not in _PAYMENT_METHODS_BY_LANE:
+    # คงพฤติกรรมเดิม: ค่าอื่นนอกเหนือ ALL/MTC ถือเป็น ETC
+    logger.warning("Unknown Lane_Type '{}' in config. Falling back to ETC.", Lane_Type)
+_payment_methods = _PAYMENT_METHODS_BY_LANE.get(Lane_Type, _PAYMENT_METHODS_BY_LANE['ETC'])
+
+SQL_QUERY = f"""
+    SELECT TOP {int(config.get('QUERY_LIMIT', 100))}
+        dpt.DMTPX_ID,
+        dpt.DMTPX_PLAZA_ID,
+        dpt.DMTPX_LANE_ID,
+        dpt.DMTPX_NTRX_NO,
+        dpt.DMTPX_TRX_DATETIME,
+        dpt.DMTPX_TC_PAYMENTMETHOD_ID,
+        dpt.DMTPX_SIGNAL_CODE,
+        dpt.DMTPX_LICENCEPLATE,
+        dpt.DMTPX_PROVINCEID,
+        dpt.DMTPX_IMAGE_FILE_02 as Image1,
+        dpt.DMTPX_IMAGE_FILE_01 as Image2,
+        dpt.DMTPX_IMAGE_FILE_03 as Image3
+    FROM DMT_PASSING_TRANSACTION dpt
+    WHERE dpt.DMTPX_TRX_DATETIME
+        BETWEEN DATEADD(DAY,-{int(config.get('Back_date', 7))},CONCAT(CONVERT(DATE,GETDATE()),' 00:00:00.000'))
+            AND DATEADD(minute,-{int(config.get('Back_Time', 10))},GETDATE())
+    AND dpt.DMTPX_TRX_DATETIME >= '2025-07-25 00:00:00.000'
+    AND dpt.DMTPX_TC_PAYMENTMETHOD_ID IN ({_payment_methods})
+    AND dpt.DMTPX_SIGNAL_CODE IN (1,2,10,19,82,20,22,23,24,26)
+    AND (dpt.DMTPX_LICENCEPLATE IS NULL OR dpt.DMTPX_LICENCEPLATE = '')
+    ORDER BY dpt.DMTPX_TRX_DATETIME;
+"""
 
 # ----------------------- HTTP Session Pool (ต่อเธรด) -----------------------
 _SESSION_LOCAL = threading.local()
@@ -227,32 +179,6 @@ def get_http_session() -> requests.Session:
         _SESSION_LOCAL.session = s
         logger.debug("HTTP session constructed with pooled adapters for current thread.")
     return s
-
-# ----------------------- DB Connection (เดิม) -----------------------
-def get_db_connection():
-    try:
-        conn_str = (
-            f"DRIVER={config.get('DB_DRIVER', 'ODBC Driver 17 for SQL Server')};"
-            f"SERVER={config.get('DB_SERVER')};"
-            f"PORT={config.get('DB_PORT', 1433)};"
-            f"DATABASE={config.get('DB_DATABASE')};"
-            f"UID={config.get('DB_USERNAME')};"
-            f"PWD={config.get('DB_PASSWORD')};"
-            f"Encrypt=yes;"
-            f"TrustServerCertificate=yes;"
-            f"MARS_Connection=yes;"
-        )
-        autocommit = bool(int(config.get("DB_AUTOCOMMIT", 1)))
-        conn = pyodbc.connect(conn_str, autocommit=autocommit)
-        try:
-            conn.timeout = int(config.get("DB_TIMEOUT", 30))
-        except Exception:
-            pass
-        logger.info("Database connection established successfully (autocommit={} ).", autocommit)
-        return conn
-    except Exception as e:
-        logger.error("Failed to connect to database: {}", e)
-        return None
 
 # ----------------------- Image base_urls Round-robin -----------------------
 base_urls = config.get('base_urls', [])
@@ -367,23 +293,60 @@ def download_image(image_path: Optional[str], transaction_id: int) -> Tuple[Opti
                  transaction_id, reason)
     return None, reason
 
-def call_alpr(image_bytes: bytes, transaction_datetime: datetime):
+def _extract_alpr_confidence(data) -> Optional[float]:
+    """ดึง confidence จาก response ของ /api/v1/alpr
+    หลัก: ค่าเฉลี่ยของ LicensePlateConfidence กับ ProvinceConfidence (ระดับบนสุด)
+          ถ้ามีแค่ตัวใดตัวหนึ่ง ใช้ตัวนั้น
+    เผื่อ 1: confidence ระดับบนสุด ถ้า API ส่งมา
+    เผื่อ 2: ealpr_recognition[].results[].confidence (เอาค่าสูงสุด)"""
+    def _to_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    lp_conf = _to_float(data.get("LicensePlateConfidence"))
+    prov_conf = _to_float(data.get("ProvinceConfidence"))
+    parts = [c for c in (lp_conf, prov_conf) if c is not None]
+    if parts:
+        return sum(parts) / len(parts)
+
+    top = _to_float(data.get("confidence"))
+    if top is not None:
+        return top
+
+    best = None
+    for rec in data.get("ealpr_recognition") or []:
+        for res in rec.get("results") or []:
+            c = _to_float(res.get("confidence"))
+            if c is not None and (best is None or c > best):
+                best = c
+    return best
+
+def _format_trx_datetime(transaction_datetime):
+    """แปลง DMTPX_TRX_DATETIME เป็นสตริง 'YYYY-MM-DD HH:MM:SS.mmm' (มิลลิวินาที 3 หลัก)
+    รองรับทั้ง datetime object และสตริง (คืนค่าตามเดิมถ้าเป็นสตริง)"""
+    if isinstance(transaction_datetime, datetime):
+        return transaction_datetime.strftime('%Y-%m-%d %H:%M:%S.') + f"{transaction_datetime.microsecond // 1000:03d}"
+    return str(transaction_datetime) if transaction_datetime is not None else ""
+
+
+def call_alpr(image_bytes: bytes, transaction_datetime=None):
+    """v6.0: เรียก ALPR API ใหม่ (/api/v1/alpr)
+    - payload ส่งแค่ Trx_Datetime (DMTPX_TRX_DATETIME) และ alpr_image
+      (base64 ล้วน ไม่มี data URI prefix)
+    - LicensePlate/ProvinceID/PlateImageUrl อยู่ระดับบนสุดของ response
+    - confidence อยู่ใน ealpr_recognition[].results[]
+    - เขียน ProvinceID (ตัวเลข) ลง DMTPX_PROVINCEID แทนชื่อจังหวัด
+    - คืนชื่อไฟล์ของ PlateImageUrl (เฉพาะ basename) สำหรับเขียนลง DMTPX_PROMOTIONID
+    คืนค่า: (status_tag, license_plate, province_id, confidence, plate_image_url)"""
     if not image_bytes:
-        return 'error', None, None, None
+        return 'error', None, None, None, None
 
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
     payload = {
-        "data_type": "alpr_recognition",
-        "hw_id": "a1027724-70dd-4b92-85ad-cdb0984ddd62",
-        "user_id": "001",
-        "os": "Win32NT",
-        "date_time": transaction_datetime.strftime('%Y-%m-%d %H:%M:%S'),
-        "license_plate_rec": "true",
+        "Trx_Datetime": _format_trx_datetime(transaction_datetime),
         "alpr_image": base64_image,
-        "latitude": "",
-        "longitude": "",
-        "country": "th",
-        "Place": ""
     }
 
     target_url = get_available_target_url()
@@ -403,47 +366,47 @@ def call_alpr(image_bytes: bytes, transaction_datetime: datetime):
         data = r.json() if r.content else {}
         status = (data.get("status") or "").strip()
         lp = (data.get("LicensePlate") or "").strip()
-        prov = (data.get("Province") or "").strip()
-        conf_raw = data.get("confidence", None)
+        province_id = data.get("ProvinceID", None)
+        # เก็บแค่ชื่อไฟล์ของ PlateImageUrl ลง DMTPX_PROMOTIONID
+        # เช่น http://172.30.73.224:8000/plates/20260610/66010e37_0.jpg -> 66010e37_0.jpg
+        plate_url = (data.get("PlateImageUrl") or "").strip()
+        if plate_url:
+            plate_url = plate_url.rstrip('/').rsplit('/', 1)[-1]
+        conf = _extract_alpr_confidence(data)
 
-        conf = None
-        if conf_raw not in (None, ""):
-            try:
-                conf = float(conf_raw)
-            except Exception:
-                conf = None
+        # normalize status เพื่อรองรับหลายรูปแบบ เช่น 'NoLicensePlate', 'no license plate'
+        status_norm = status.lower().replace(" ", "").replace("_", "")
 
-        status_lower = status.lower()
-        if status_lower == 'ok':
+        if status_norm == 'ok':
+            handle_api_success(target_url)
             if not lp:
-                handle_api_success(target_url)
-                return 'no_plate', "", "", conf
-            handle_api_success(target_url)
-            return 'ok', lp, prov, conf
+                # รองรับกรณี status=ok แต่ไม่เจอป้ายในภาพ
+                return 'no_plate', "", "", conf, ""
+            return 'ok', lp, province_id, conf, plate_url
 
-        if status_lower in ('nolicenseplate', 'no license plate'):
+        if status_norm in ('nolicenseplate', 'noplate'):
             handle_api_success(target_url)
-            return 'no_plate', "", "", conf
+            return 'no_plate', "", "", conf, ""
 
-        if status in {'ErrorSeverFail', 'ErrorRequestFail', 'ErrorHttpFail', 'ErrorInternalFail'}:
-            logger.warning("[call_alpr] ALPR error status: {}", status)
+        if status_norm.startswith('error'):
+            logger.warning("[call_alpr] ALPR error status: {} msg: {}", status, data.get("msg"))
             handle_api_failure(target_url)
-            return 'error', None, None, None
+            return 'error', None, None, None, None
 
-        logger.warning("[call_alpr] Unexpected status from ALPR: {}", status)
-        return 'unknown_error', None, None, None
+        logger.warning("[call_alpr] Unexpected status from ALPR: {} msg: {}", status, data.get("msg"))
+        return 'unknown_error', None, None, None, None
 
     except requests.exceptions.Timeout as e:
         logger.error("[call_alpr] Timeout calling {}: {}", target_url, e)
         handle_api_failure(target_url)
-        return 'error', None, None, None
+        return 'error', None, None, None, None
     except requests.exceptions.RequestException as e:
         logger.error("[call_alpr] HTTP error calling {}: {}", target_url, e)
         handle_api_failure(target_url)
-        return 'error', None, None, None
+        return 'error', None, None, None, None
     except Exception as e:
         logger.error("[call_alpr] Unexpected exception: {}", e, exc_info=True)
-        return 'unknown_error', None, None, None
+        return 'unknown_error', None, None, None, None
 
 # ----------------------- Core: Process one row -----------------------
 def process_single_transaction(row, update_queue):
@@ -481,7 +444,7 @@ def process_single_transaction(row, update_queue):
             update_queue.put((transaction_id, "No Image", "", transaction_datetime, plaza_id, lane_id, ntrx_no, None))
             return
 
-        best = {"conf": float("-inf"), "lp": None, "prov": None, "source": None}
+        best = {"conf": float("-inf"), "lp": None, "prov": None, "plate_url": None}
         no_plate_count = 0
         alpr_called = 0
 
@@ -489,10 +452,10 @@ def process_single_transaction(row, update_queue):
             if not img_bytes:
                 continue
 
-            status_tag, lp, prov, conf = call_alpr(img_bytes, transaction_datetime)
+            status_tag, lp, prov, conf, plate_url = call_alpr(img_bytes, transaction_datetime)
             alpr_called += 1
-            logger.debug("[process_single_transaction] tx={} ALPR idx={} status={} lp='{}' prov='{}' conf={}",
-                         transaction_id, idx, status_tag, lp, prov, conf)
+            logger.debug("[process_single_transaction] tx={} ALPR idx={} status={} lp='{}' prov='{}' conf={} url='{}'",
+                         transaction_id, idx, status_tag, lp, prov, conf, plate_url)
 
             if status_tag == 'ok':
                 c = conf if conf is not None else -1.0
@@ -501,16 +464,16 @@ def process_single_transaction(row, update_queue):
                         "conf": c,
                         "lp": lp or "",
                         "prov": prov or "",
-                        "source": f"IMAGE_FILE_0{idx}"
+                        "plate_url": plate_url or ""
                     })
             elif status_tag == 'no_plate':
                 no_plate_count += 1
 
         if best["lp"] is not None and best["lp"] != "" and best["conf"] != float("-inf"):
-            logger.info("[process_single_transaction] tx={} Update with BEST (conf={}) src={}", transaction_id, best['conf'], best['source'])
+            logger.info("[process_single_transaction] tx={} Update with BEST (conf={}) url={}", transaction_id, best['conf'], best['plate_url'])
             update_queue.put((
                 transaction_id, best["lp"], best["prov"],
-                transaction_datetime, plaza_id, lane_id, ntrx_no, best["source"]
+                transaction_datetime, plaza_id, lane_id, ntrx_no, best["plate_url"]
             ))
             return
 
@@ -525,131 +488,8 @@ def process_single_transaction(row, update_queue):
     except Exception as e:
         logger.error("Exception in process_single_transaction: {}", e, exc_info=True)
 
-# ----------------------- Process batch (เดิม) -----------------------
-def process_transactions():
-    conn = get_db_connection()
-    if not conn:
-        logger.error("Could not establish a database connection. Aborting this run.")
-        return
-
-    try:
-        cursor = conn.cursor()
-        try:
-            cursor.timeout = int(config.get("DB_TIMEOUT", 30))
-        except Exception:
-            pass
-
-        cursor.execute(SQL_QUERY)
-        rows = cursor.fetchall()
-        logger.info("Fetched {} records to process.", len(rows))
-        if rows:
-            logger.debug("Sample row (first id/time): {}, {}", rows[0][0], rows[0][4])
-        if not rows:
-            conn.close()
-            logger.info("No records. Database connection closed.")
-            return
-
-        update_queue: "queue.Queue" = queue.Queue()
-
-        def db_update_worker():
-            logger.debug("[db_update_worker] Started.")
-            while True:
-                item = update_queue.get()
-                logger.debug("[db_update_worker] Got item. Queue size after get: {}", update_queue.qsize())
-                if item is None:
-                    logger.debug("[db_update_worker] Received shutdown signal.")
-                    update_queue.task_done()
-                    break
-                try:
-                    update_transaction_result(conn, *item)
-                except Exception as e:
-                    logger.error("DB update worker error: {}", e)
-                finally:
-                    update_queue.task_done()
-
-        db_thread = threading.Thread(target=db_update_worker, name="db-update")
-        db_thread.start()
-
-        if config.get('Enable_Fix_Workers', 0) >= 1:
-            workers = max(1, int(config.get('Workers', 4)))
-            logger.info("Using fixed {} worker threads.", workers)
-        else:
-            workers = max(1, len(TARGET_URLS))
-            if workers == 0:
-                logger.error("No TARGET_URL configured. Cannot process.")
-                update_queue.put(None)
-                db_thread.join()
-                conn.close()
-                return
-            logger.info("Using {} worker threads based on number of TARGET_URLs.", workers)
-
-        if not get_available_target_url():
-            logger.critical("All TARGET_URLs are currently disabled by the circuit breaker. Waiting until available...")
-            wait_for_available_target_url()
-
-        logger.debug("[process_transactions] Starting ThreadPoolExecutor with {} workers.", workers)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tx") as executor:
-            futures = [executor.submit(process_single_transaction, row, update_queue) for row in rows]
-            concurrent.futures.wait(futures)
-            logger.info("All processing tasks for this batch have been completed.")
-
-        logger.debug("[process_transactions] Waiting for update_queue to become empty...")
-        update_queue.join()
-        logger.debug("[process_transactions] Queue empty. Sending shutdown signal to db_update_worker.")
-        update_queue.put(None)
-        db_thread.join()
-        logger.info("All DB updates completed.")
-
-        conn.close()
-        logger.info("Database connection closed.")
-
-    except Exception as e:
-        logger.critical("An unhandled exception occurred in process_transactions: {}", e, exc_info=True)
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-# ----------------------- DB Update (เดิม) -----------------------
-def update_transaction_result(conn, transaction_id, license_plate, province, transaction_datetime, plaza_id, lane_id, ntrx_no, image_source):
-    try:
-        with conn.cursor() as cursor:
-            try:
-                cursor.timeout = int(config.get("DB_TIMEOUT", 30))
-            except Exception:
-                pass
-
-            if license_plate == "" and province == "":
-                logger.debug("DB UPDATE (No LPR): id={} src={} ntrx={}", transaction_id, image_source, ntrx_no)
-                cursor.execute(
-                    "UPDATE DMT_PASSING_TRANSACTION SET DMTPX_LICENCEPLATE = ?, DMTPX_PROMOTIONID = ? "
-                    "WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
-                    ("No LPR", image_source, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
-                )
-            else:
-                logger.debug("DB UPDATE (LPR): id={} lp='{}' prov='{}' src={} ntrx={}",
-                             transaction_id, license_plate, province, image_source, ntrx_no)
-                cursor.execute(
-                    "UPDATE DMT_PASSING_TRANSACTION SET DMTPX_LICENCEPLATE = ?, DMTPX_PROVINCEID = ?, DMTPX_PROMOTIONID = ? "
-                    "WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
-                    (license_plate, province, image_source, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
-                )
-
-            if not getattr(conn, "autocommit", False):
-                conn.commit()
-        logger.info("Database updated successfully (transaction_id: {}).", transaction_id)
-    except pyodbc.Error as e:
-        logger.error("Database update failed for transaction_id {}: {}", transaction_id, e)
-        try:
-            if not getattr(conn, "autocommit", False):
-                conn.rollback()
-                logger.warning("Transaction rolled back for transaction_id {}.", transaction_id)
-        except pyodbc.Error as rb_e:
-            logger.error("Failed to rollback transaction: {}", rb_e)
-
 # ============================================================================================
-# FAILOVER + PRIMARY/SECONDARY LOG + METRICS + RATE LIMIT PATCH
-# เงื่อนไข: ไม่แก้ body ฟังก์ชันเดิม -> ใช้วิธี monkey patch แทน
+# FAILOVER + PRIMARY/SECONDARY LOG + METRICS + RATE LIMIT
 # ============================================================================================
 _DB_CONN_LOCK = threading.Lock()
 _DB_CONN = None
@@ -754,7 +594,7 @@ def _server_candidates() -> List[str]:
     return [s] if s else []
 
 def _build_conn_str_for(server: str) -> str:
-    driver = config.get("DB_DRIVER", "ODBC Driver 18 for SQL Server")
+    driver = config.get("DB_DRIVER", "ODBC Driver 17 for SQL Server")
     port = int(config.get("DB_PORT", 1433))
     db = config.get("DB_DATABASE")
     uid = config.get("DB_USERNAME")
@@ -872,54 +712,49 @@ def _get_or_reconnect_db(force: bool = False):
     global _DB_CONN
 
     with _DB_CONN_LOCK:
-        if force or _DB_CONN is None:
-            _rate_limit_reconnect()
-            _DB_METRICS["reconnect_count"] += 1
-            try:
-                if _DB_CONN is not None:
-                    try:
-                        _DB_CONN.close()
-                    except Exception:
-                        pass
-            finally:
-                _DB_CONN = None
-
-        if _DB_CONN is None:
-            max_attempts = int(config.get("DB_CONNECT_MAX_ATTEMPTS", 6))
-            base = 0.5
-            last = None
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    _DB_CONN = _connect_new_any_endpoint()
-                    return _DB_CONN
-                except _PrimaryNotAvailable as e:
-                    # ✅ เจอแต่ secondary -> พักยาวขึ้นแล้วค่อยลองใหม่ (กัน loop 3906)
-                    sleep_sec = int(config.get("DB_SECONDARY_SLEEP_SEC", 15))
-                    logger.warning("[DB FAILOVER] {} -> sleep {}s then retry", e, sleep_sec)
-                    time.sleep(sleep_sec)
-                    last = e
-            raise last
-
-        try:
-            cur = _DB_CONN.cursor()
-            try:
-                cur.timeout = int(config.get("DB_TIMEOUT", 30))  # กัน SELECT 1 ค้าง
-            except Exception:
-                pass
-            cur.execute("SELECT 1")
-            cur.fetchone()
-        except Exception as e:
-            logger.warning("DB connection seems broken ({}). Forcing reconnect...", e)
-            # ไม่เรียกตัวเองซ้ำใน lock -> ปลอด deadlock
-            force = True
-            # ทำการปิด conn เดิมแล้วสร้างใหม่ต่อด้านล่าง
+        if force and _DB_CONN is not None:
             try:
                 _DB_CONN.close()
             except Exception:
                 pass
             _DB_CONN = None
 
-        return _DB_CONN
+        # health check connection เดิมก่อนใช้ซ้ำ
+        if _DB_CONN is not None:
+            try:
+                cur = _DB_CONN.cursor()
+                try:
+                    cur.timeout = int(config.get("DB_TIMEOUT", 30))  # กัน SELECT 1 ค้าง
+                except Exception:
+                    pass
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                return _DB_CONN
+            except Exception as e:
+                logger.warning("DB connection seems broken ({}). Forcing reconnect...", e)
+                try:
+                    _DB_CONN.close()
+                except Exception:
+                    pass
+                _DB_CONN = None
+
+        # สร้าง connection ใหม่ (หา PRIMARY เท่านั้น)
+        _rate_limit_reconnect()
+        _DB_METRICS["reconnect_count"] += 1
+        max_attempts = int(config.get("DB_CONNECT_MAX_ATTEMPTS", 6))
+        last = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                _DB_CONN = _connect_new_any_endpoint()
+                return _DB_CONN
+            except _PrimaryNotAvailable as e:
+                # ✅ เจอแต่ secondary -> พักยาวขึ้นแล้วค่อยลองใหม่ (กัน loop 3906)
+                sleep_sec = int(config.get("DB_SECONDARY_SLEEP_SEC", 15))
+                logger.warning("[DB FAILOVER] {} -> sleep {}s then retry (attempt {}/{})",
+                               e, sleep_sec, attempt, max_attempts)
+                time.sleep(sleep_sec)
+                last = e
+        raise last
 
 def _is_primary_replica(conn) -> bool:
     try:
@@ -944,7 +779,7 @@ def get_db_connection_failover_ready():
 
 
 def update_transaction_result_failover_ready(conn, transaction_id, license_plate, province,
-                                             transaction_datetime, plaza_id, lane_id, ntrx_no, image_source):
+                                             transaction_datetime, plaza_id, lane_id, ntrx_no, plate_image_url):
     max_attempts = int(config.get("DB_UPDATE_MAX_ATTEMPTS", 6))
     base = 0.5
     last_exc = None
@@ -968,14 +803,14 @@ def update_transaction_result_failover_ready(conn, transaction_id, license_plate
                         "UPDATE DMT_PASSING_TRANSACTION "
                         "SET DMTPX_LICENCEPLATE = ?, DMTPX_PROMOTIONID = ? "
                         "WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
-                        ("No LPR", image_source, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
+                        ("No LPR", plate_image_url, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
                     )
                 else:
                     cursor.execute(
                         "UPDATE DMT_PASSING_TRANSACTION "
                         "SET DMTPX_LICENCEPLATE = ?, DMTPX_PROVINCEID = ?, DMTPX_PROMOTIONID = ? "
                         "WHERE DMTPX_TRX_DATETIME = ? and DMTPX_ID = ? and DMTPX_PLAZA_ID = ? and DMTPX_LANE_ID = ? and DMTPX_NTRX_NO = ?",
-                        (license_plate, province, image_source, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
+                        (license_plate, province, plate_image_url, transaction_datetime, transaction_id, plaza_id, lane_id, ntrx_no)
                     )
 
                 if not getattr(conn, "autocommit", False):
@@ -1069,7 +904,7 @@ def process_transactions_failover_ready():
                 update_queue.task_done()
                 break
             try:
-                update_transaction_result(conn, *item)
+                update_transaction_result_failover_ready(conn, *item)
             except Exception as e:
                 logger.error("DB update worker error: {}", e, exc_info=True)
             finally:
@@ -1109,17 +944,12 @@ def process_transactions_failover_ready():
     logger.info("Database connection closed (global cleared).")
 
 
-# --- Monkey patch (สลับให้ใช้ failover-ready โดยไม่แก้ฟังก์ชันเดิม) ---
-get_db_connection = get_db_connection_failover_ready
-update_transaction_result = update_transaction_result_failover_ready
-process_transactions = process_transactions_failover_ready
-
 # ----------------------- Main Loop -----------------------
 if __name__ == "__main__":
     logger.info("Starting {} v{}", Program_Name, Program_Version)
     while True:
         try:
-            process_transactions()
+            process_transactions_failover_ready()
             logger.info("Run complete. Waiting for {} seconds before the next run.", config.get('RETRY_INTERVAL', 3600))
             time.sleep(config.get('RETRY_INTERVAL', 3600))
         except KeyboardInterrupt:

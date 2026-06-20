@@ -1,0 +1,17 @@
+# Logs
+logs/
+
+# Runtime config (contains DB credentials — keep out of VCS)
+*_config.json
+Trasation_Process_config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Backups
+*.bak
+
+# OS / editor
+.DS_Store
+.vscode/
