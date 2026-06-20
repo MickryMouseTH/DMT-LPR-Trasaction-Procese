@@ -1,6 +1,6 @@
 # DMT LPR Transaction Process — เอกสารโครงสร้างโปรแกรม
 
-> **โปรแกรม:** `Trasation_Process` เวอร์ชัน **6.0.1**
+> **โปรแกรม:** `Trasation_Process` เวอร์ชัน **6.0.2**
 > **ภาษา:** Python (ใช้ pyodbc, requests, loguru)
 > **หน้าที่:** ดึงรายการธุรกรรมผ่านด่าน (DMT Passing Transaction) ที่ยังไม่มีเลขทะเบียนรถจาก SQL Server → ดาวน์โหลดภาพรถจาก Image Server → ส่งภาพไปอ่านป้ายทะเบียนด้วย ALPR API → อัปเดตผลกลับลงฐานข้อมูล ทำงานวนซ้ำเป็นรอบ (loop) ตลอดเวลา
 
@@ -44,7 +44,7 @@
              │
              ├─ ⑤ เรียก ALPR API ทีละภาพ (POST base64 JSON)
              │    - Round-robin TARGET_URL + Circuit Breaker
-             │    - เก็บผลที่ confidence สูงสุด
+             │    - เก็บ LP จากภาพ lp_conf สูงสุด, Province จากภาพ prov_conf สูงสุด (แยกกัน)
              │
              └─ ⑥ ใส่ผลลง update_queue
              ▼
@@ -58,7 +58,7 @@
 
 | สถานการณ์ | ค่าที่อัปเดตลง DB |
 |---|---|
-| อ่านป้ายได้อย่างน้อย 1 ภาพ | เลขทะเบียน + `ProvinceID` ของภาพที่ **confidence สูงสุด** + `DMTPX_PROMOTIONID` = `PlateImageUrl` จาก API |
+| อ่านป้ายได้อย่างน้อย 1 ภาพ | `DMTPX_LICENCEPLATE` = LP ของภาพ **`lp_conf` สูงสุด**, `DMTPX_PROVINCEID` = `ProvinceID` ของภาพ **`prov_conf` สูงสุด** (แยกภาพได้), `DMTPX_PROMOTIONID` = `PlateImageUrl` ของภาพ LP |
 | ดาวน์โหลดภาพไม่ได้เลยทั้ง 3 รูป | `DMTPX_LICENCEPLATE = "No Image"` |
 | ALPR ตอบ NoLicensePlate ทุกภาพ | `DMTPX_LICENCEPLATE = "No Plate"` |
 | ผลก้ำกึ่ง / error ปน | **ข้าม** ไม่อัปเดต (จะถูกหยิบมาทำใหม่รอบหน้า) |
@@ -170,7 +170,11 @@ Main thread
 | `status` ขึ้นต้นด้วย `error` | error → นับเป็น failure ของ circuit breaker |
 | `status` อื่น ๆ | unknown_error (ไม่นับ breaker) |
 
-**confidence:** ใช้**ค่าเฉลี่ยของ `LicensePlateConfidence` กับ `ProvinceConfidence`** (ระดับบนสุด) เป็นหลัก — ถ้ามีแค่ตัวใดตัวหนึ่งใช้ตัวนั้น; fallback 1 เป็น `confidence` ระดับบนสุดถ้ามี; fallback 2 เป็น `ealpr_recognition[].results[].confidence` (เอาค่าสูงสุด) (ฟังก์ชัน `_extract_alpr_confidence`)
+**confidence (แยก 2 ค่า):** ฟังก์ชัน `_extract_alpr_confidences()` คืน `(lp_conf, prov_conf)` แยกกัน
+- `lp_conf` = `LicensePlateConfidence` (บนสุด) → fallback `ealpr_recognition[].results[].confidence` (สูงสุด)
+- `prov_conf` = `ProvinceConfidence` (บนสุด) → fallback `ealpr_recognition[].results[].region_confidence` (สูงสุด)
+
+**การเลือกข้ามภาพ (v6.0.2):** ยิง ALPR ครบทุกภาพแล้วเลือก**แยก field** — `LicensePlate` เอาจากภาพที่ `lp_conf` สูงสุด, `ProvinceID` เอาจากภาพที่ `prov_conf` สูงสุด (มาจากคนละภาพกันได้) ส่วน `DMTPX_PROMOTIONID` (`PlateImageUrl`) ผูกกับภาพของ `LicensePlate`
 
 **หมายเหตุภาพ:** คอลัมน์ DB ถูก map สลับลำดับ — `IMAGE_FILE_02` → Image1 (ลองก่อน), `IMAGE_FILE_01` → Image2, `IMAGE_FILE_03` → Image3
 
@@ -300,3 +304,12 @@ urllib3     # (มากับ requests) ใช้ Retry
 - `_extract_alpr_confidence()` เปลี่ยนมาใช้**ค่าเฉลี่ยของ `LicensePlateConfidence` กับ `ProvinceConfidence`** เป็นหลัก (เช่น `(97.6 + 97.9) / 2 = 97.75`) — ถ้ามีแค่ตัวใดตัวหนึ่งใช้ตัวนั้น
 - ยังคง fallback เดิมไว้: fallback 1 = `confidence` ระดับบนสุด, fallback 2 = `ealpr_recognition[].results[].confidence` (ค่าสูงสุด)
 - ไม่กระทบ logic อื่น — ค่า confidence ยังใช้เลือกภาพที่ดีที่สุด (best-confidence wins) เหมือนเดิม
+- ⚠️ **ถูกแทนที่ด้วย v6.0.2** ซึ่งเลิกใช้ค่าเฉลี่ยและแยก `lp_conf`/`prov_conf` (ดูหัวข้อ 16)
+
+## 16. v6.0.2 — เลือก LP / Province แยกภาพตาม confidence ของแต่ละ field (2026-06-21)
+
+- เปลี่ยนจากการเลือก "ภาพที่ดีที่สุดภาพเดียว" มาเป็นเลือก**แยก field**: ในเมื่อยิง ALPR ครบทุกภาพอยู่แล้ว ก็เอา `LicensePlate` จากภาพที่ `LicensePlateConfidence` สูงสุด และ `ProvinceID` จากภาพที่ `ProvinceConfidence` สูงสุด (มาจากคนละภาพกันได้)
+- แทน `_extract_alpr_confidence()` (ค่าเฉลี่ย) ด้วย `_extract_alpr_confidences()` ที่คืน `(lp_conf, prov_conf)` แยกกัน — `prov_conf` fallback ใช้ `region_confidence` ใน results
+- `call_alpr` คืน 6-tuple: `(status_tag, lp, province_id, lp_conf, prov_conf, plate_image_url)` (เดิม 5-tuple)
+- `process_single_transaction` เก็บ `best_lp` (ตาม `lp_conf`) และ `best_prov` (ตาม `prov_conf`) แยกกัน; `DMTPX_PROMOTIONID` (`PlateImageUrl`) ผูกกับภาพของ LP
+- เงื่อนไขอัปเดต DB: อัปเดตเมื่อมี LP (ภาพ `lp_conf` สูงสุด); ถ้าไม่มีภาพไหนเจอจังหวัดเลย → `DMTPX_PROVINCEID = ""`. ส่วน "No Image" / "No Plate" / skip เหมือนเดิม

@@ -22,7 +22,7 @@ except Exception:
 
 # ----------------------- Configuration Values -----------------------
 Program_Name = "Trasation_Process"
-Program_Version = "6.0.1"
+Program_Version = "6.0.2"
 
 # ค่าตั้งต้น
 default_config = {
@@ -293,12 +293,13 @@ def download_image(image_path: Optional[str], transaction_id: int) -> Tuple[Opti
                  transaction_id, reason)
     return None, reason
 
-def _extract_alpr_confidence(data) -> Optional[float]:
-    """ดึง confidence จาก response ของ /api/v1/alpr
-    หลัก: ค่าเฉลี่ยของ LicensePlateConfidence กับ ProvinceConfidence (ระดับบนสุด)
-          ถ้ามีแค่ตัวใดตัวหนึ่ง ใช้ตัวนั้น
-    เผื่อ 1: confidence ระดับบนสุด ถ้า API ส่งมา
-    เผื่อ 2: ealpr_recognition[].results[].confidence (เอาค่าสูงสุด)"""
+def _extract_alpr_confidences(data) -> Tuple[Optional[float], Optional[float]]:
+    """ดึง (lp_conf, prov_conf) จาก response ของ /api/v1/alpr แยกกัน
+    - lp_conf  : LicensePlateConfidence (ระดับบนสุด)
+                 เผื่อ: ealpr_recognition[].results[].confidence (เอาค่าสูงสุด)
+    - prov_conf: ProvinceConfidence (ระดับบนสุด)
+                 เผื่อ: ealpr_recognition[].results[].region_confidence (เอาค่าสูงสุด)
+    ใช้เลือกแยกกัน: LicensePlate เอาภาพ lp_conf สูงสุด, ProvinceID เอาภาพ prov_conf สูงสุด"""
     def _to_float(v):
         try:
             return float(v)
@@ -307,21 +308,25 @@ def _extract_alpr_confidence(data) -> Optional[float]:
 
     lp_conf = _to_float(data.get("LicensePlateConfidence"))
     prov_conf = _to_float(data.get("ProvinceConfidence"))
-    parts = [c for c in (lp_conf, prov_conf) if c is not None]
-    if parts:
-        return sum(parts) / len(parts)
 
-    top = _to_float(data.get("confidence"))
-    if top is not None:
-        return top
+    # fallback ไปอ่านระดับ results ถ้าไม่มี field บนสุด
+    if lp_conf is None or prov_conf is None:
+        best_lp = None
+        best_prov = None
+        for rec in data.get("ealpr_recognition") or []:
+            for res in rec.get("results") or []:
+                c = _to_float(res.get("confidence"))
+                if c is not None and (best_lp is None or c > best_lp):
+                    best_lp = c
+                rc = _to_float(res.get("region_confidence"))
+                if rc is not None and (best_prov is None or rc > best_prov):
+                    best_prov = rc
+        if lp_conf is None:
+            lp_conf = best_lp
+        if prov_conf is None:
+            prov_conf = best_prov
 
-    best = None
-    for rec in data.get("ealpr_recognition") or []:
-        for res in rec.get("results") or []:
-            c = _to_float(res.get("confidence"))
-            if c is not None and (best is None or c > best):
-                best = c
-    return best
+    return lp_conf, prov_conf
 
 def _format_trx_datetime(transaction_datetime):
     """แปลง DMTPX_TRX_DATETIME เป็นสตริง 'YYYY-MM-DD HH:MM:SS.mmm' (มิลลิวินาที 3 หลัก)
@@ -336,12 +341,12 @@ def call_alpr(image_bytes: bytes, transaction_datetime=None):
     - payload ส่งแค่ Trx_Datetime (DMTPX_TRX_DATETIME) และ alpr_image
       (base64 ล้วน ไม่มี data URI prefix)
     - LicensePlate/ProvinceID/PlateImageUrl อยู่ระดับบนสุดของ response
-    - confidence อยู่ใน ealpr_recognition[].results[]
+    - LicensePlateConfidence / ProvinceConfidence แยกกัน (ใช้เลือกแยก field)
     - เขียน ProvinceID (ตัวเลข) ลง DMTPX_PROVINCEID แทนชื่อจังหวัด
     - คืนชื่อไฟล์ของ PlateImageUrl (เฉพาะ basename) สำหรับเขียนลง DMTPX_PROMOTIONID
-    คืนค่า: (status_tag, license_plate, province_id, confidence, plate_image_url)"""
+    คืนค่า: (status_tag, license_plate, province_id, lp_conf, prov_conf, plate_image_url)"""
     if not image_bytes:
-        return 'error', None, None, None, None
+        return 'error', None, None, None, None, None
 
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
     payload = {
@@ -372,7 +377,7 @@ def call_alpr(image_bytes: bytes, transaction_datetime=None):
         plate_url = (data.get("PlateImageUrl") or "").strip()
         if plate_url:
             plate_url = plate_url.rstrip('/').rsplit('/', 1)[-1]
-        conf = _extract_alpr_confidence(data)
+        lp_conf, prov_conf = _extract_alpr_confidences(data)
 
         # normalize status เพื่อรองรับหลายรูปแบบ เช่น 'NoLicensePlate', 'no license plate'
         status_norm = status.lower().replace(" ", "").replace("_", "")
@@ -381,32 +386,32 @@ def call_alpr(image_bytes: bytes, transaction_datetime=None):
             handle_api_success(target_url)
             if not lp:
                 # รองรับกรณี status=ok แต่ไม่เจอป้ายในภาพ
-                return 'no_plate', "", "", conf, ""
-            return 'ok', lp, province_id, conf, plate_url
+                return 'no_plate', "", "", lp_conf, prov_conf, ""
+            return 'ok', lp, province_id, lp_conf, prov_conf, plate_url
 
         if status_norm in ('nolicenseplate', 'noplate'):
             handle_api_success(target_url)
-            return 'no_plate', "", "", conf, ""
+            return 'no_plate', "", "", lp_conf, prov_conf, ""
 
         if status_norm.startswith('error'):
             logger.warning("[call_alpr] ALPR error status: {} msg: {}", status, data.get("msg"))
             handle_api_failure(target_url)
-            return 'error', None, None, None, None
+            return 'error', None, None, None, None, None
 
         logger.warning("[call_alpr] Unexpected status from ALPR: {} msg: {}", status, data.get("msg"))
-        return 'unknown_error', None, None, None, None
+        return 'unknown_error', None, None, None, None, None
 
     except requests.exceptions.Timeout as e:
         logger.error("[call_alpr] Timeout calling {}: {}", target_url, e)
         handle_api_failure(target_url)
-        return 'error', None, None, None, None
+        return 'error', None, None, None, None, None
     except requests.exceptions.RequestException as e:
         logger.error("[call_alpr] HTTP error calling {}: {}", target_url, e)
         handle_api_failure(target_url)
-        return 'error', None, None, None, None
+        return 'error', None, None, None, None, None
     except Exception as e:
         logger.error("[call_alpr] Unexpected exception: {}", e, exc_info=True)
-        return 'unknown_error', None, None, None, None
+        return 'unknown_error', None, None, None, None, None
 
 # ----------------------- Core: Process one row -----------------------
 def process_single_transaction(row, update_queue):
@@ -444,7 +449,10 @@ def process_single_transaction(row, update_queue):
             update_queue.put((transaction_id, "No Image", "", transaction_datetime, plaza_id, lane_id, ntrx_no, None))
             return
 
-        best = {"conf": float("-inf"), "lp": None, "prov": None, "plate_url": None}
+        # เลือกแยกกัน: LicensePlate เอาภาพที่ lp_conf สูงสุด, ProvinceID เอาภาพที่ prov_conf สูงสุด
+        # (อาจมาจากคนละภาพกันได้ เพราะยิง ALPR ทุกภาพอยู่แล้ว) plate_url ผูกกับภาพของ LP
+        best_lp = {"conf": float("-inf"), "lp": None, "plate_url": None}
+        best_prov = {"conf": float("-inf"), "prov": None}
         no_plate_count = 0
         alpr_called = 0
 
@@ -452,28 +460,29 @@ def process_single_transaction(row, update_queue):
             if not img_bytes:
                 continue
 
-            status_tag, lp, prov, conf, plate_url = call_alpr(img_bytes, transaction_datetime)
+            status_tag, lp, prov, lp_conf, prov_conf, plate_url = call_alpr(img_bytes, transaction_datetime)
             alpr_called += 1
-            logger.debug("[process_single_transaction] tx={} ALPR idx={} status={} lp='{}' prov='{}' conf={} url='{}'",
-                         transaction_id, idx, status_tag, lp, prov, conf, plate_url)
+            logger.debug("[process_single_transaction] tx={} ALPR idx={} status={} lp='{}' prov='{}' lp_conf={} prov_conf={} url='{}'",
+                         transaction_id, idx, status_tag, lp, prov, lp_conf, prov_conf, plate_url)
 
             if status_tag == 'ok':
-                c = conf if conf is not None else -1.0
-                if c > best["conf"]:
-                    best.update({
-                        "conf": c,
-                        "lp": lp or "",
-                        "prov": prov or "",
-                        "plate_url": plate_url or ""
-                    })
+                lc = lp_conf if lp_conf is not None else -1.0
+                if lp and lc > best_lp["conf"]:
+                    best_lp.update({"conf": lc, "lp": lp, "plate_url": plate_url or ""})
+
+                pc = prov_conf if prov_conf is not None else -1.0
+                if prov not in (None, "") and pc > best_prov["conf"]:
+                    best_prov.update({"conf": pc, "prov": prov})
             elif status_tag == 'no_plate':
                 no_plate_count += 1
 
-        if best["lp"] is not None and best["lp"] != "" and best["conf"] != float("-inf"):
-            logger.info("[process_single_transaction] tx={} Update with BEST (conf={}) url={}", transaction_id, best['conf'], best['plate_url'])
+        if best_lp["lp"]:
+            final_prov = best_prov["prov"] if best_prov["prov"] is not None else ""
+            logger.info("[process_single_transaction] tx={} Update BEST lp='{}' (lp_conf={}) prov='{}' (prov_conf={}) url={}",
+                        transaction_id, best_lp["lp"], best_lp["conf"], final_prov, best_prov["conf"], best_lp["plate_url"])
             update_queue.put((
-                transaction_id, best["lp"], best["prov"],
-                transaction_datetime, plaza_id, lane_id, ntrx_no, best["plate_url"]
+                transaction_id, best_lp["lp"], final_prov,
+                transaction_datetime, plaza_id, lane_id, ntrx_no, best_lp["plate_url"]
             ))
             return
 

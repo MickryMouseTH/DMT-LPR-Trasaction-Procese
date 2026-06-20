@@ -2,7 +2,7 @@
 
 Batch worker (Python) that fills in missing license plates on toll transactions:
 SQL Server → download lane images → ALPR API → UPDATE back. Runs in an infinite
-loop, sleeping `RETRY_INTERVAL` (default 3600s) between batches. Current: v6.0.1.
+loop, sleeping `RETRY_INTERVAL` (default 3600s) between batches. Current: v6.0.2.
 
 ## ALPR API (v6.0, since 2026-06-04)
 
@@ -12,16 +12,23 @@ loop, sleeping `RETRY_INTERVAL` (default 3600s) between batches. Current: v6.0.1
   user_id, date_time, … removed). `call_alpr(image_bytes, transaction_datetime)`;
   `Trx_Datetime` is formatted `YYYY-MM-DD HH:MM:SS.mmm` (3-digit ms) by
   `_format_trx_datetime()`.
-- Response top-level: status, LicensePlate, Province, ProvinceCode,
-  ProvinceID, PlateImageUrl, msg. Confidence is NOT top-level — it lives in
-  `ealpr_recognition[].results[].confidence`; `_extract_alpr_confidence()`
-  takes the max (falls back to top-level `confidence` if present).
+- Response top-level (v6.0.1+): status, LicensePlate, LicensePlateConfidence,
+  Province, ProvinceCode, ProvinceID, ProvinceConfidence, PlateImageUrl, msg.
+  `_extract_alpr_confidences()` returns `(lp_conf, prov_conf)` separately —
+  lp_conf from top-level `LicensePlateConfidence` (fallback: max of
+  `results[].confidence`), prov_conf from top-level `ProvinceConfidence`
+  (fallback: max of `results[].region_confidence`).
+- **Per-field cross-image selection (v6.0.2):** ALPR runs on all 3 images,
+  then LicensePlate is taken from the image with the highest lp_conf and
+  ProvinceID from the image with the highest prov_conf — they can come from
+  DIFFERENT images. DMTPX_PROMOTIONID (PlateImageUrl) follows the LP image.
 - **DMTPX_PROVINCEID now stores numeric ProvinceID (e.g. 10)** — user-chosen,
   changed from Thai province name in v5.0. Downstream readers must cope.
 - **DMTPX_PROMOTIONID now stores the PlateImageUrl filename only** (basename,
   e.g. `66010e37_0.jpg`, not the full URL) — `call_alpr` strips the path via
-  `rsplit('/', 1)[-1]`. It returns a 5-tuple (status, lp, province_id, conf,
-  plate_url) and the update function param is `plate_image_url`.
+  `rsplit('/', 1)[-1]`. `call_alpr` returns a 6-tuple (status, lp, province_id,
+  lp_conf, prov_conf, plate_url) and the update function param is
+  `plate_image_url`.
 - no_plate handled both ways: status=ok with empty LicensePlate, OR status
   normalizing to nolicenseplate/noplate. status starting with "error" trips
   the circuit breaker; other statuses → unknown_error (no breaker).
